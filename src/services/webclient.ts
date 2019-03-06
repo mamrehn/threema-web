@@ -48,6 +48,8 @@ import {VersionService} from './version';
 import {ChunkCache} from '../protocol/cache';
 import {SequenceNumber} from '../protocol/sequence_number';
 
+import {UnboundedFlowControlledDataChannel} from '../helpers/data_channel';
+
 // Aliases
 import InitializationStep = threema.InitializationStep;
 import ContactReceiverFeature = threema.ContactReceiverFeature;
@@ -75,7 +77,8 @@ const fakeConnectionId = Uint8Array.from([
  * This service handles everything related to the communication with the peer.
  */
 export class WebClientService {
-    private static CHUNK_SIZE = 64 * 1024;
+    private static DATA_CHANNEL_MAX_CHUNK_SIZE = 256 * 1024;
+    private static RELAYED_DATA_CHUNK_SIZE = 64 * 1024;
     private static SEQUENCE_NUMBER_MIN = 0;
     private static SEQUENCE_NUMBER_MAX = (2 ** 32) - 1;
     private static CHUNK_CACHE_SIZE_MAX = 2 * 1024 * 1024;
@@ -194,7 +197,10 @@ export class WebClientService {
     private connectionInfoFuture: Future<ConnectionInfo> = null;
     private webrtcTask: saltyrtc.tasks.webrtc.WebRTCTask = null;
     private relayedDataTask: saltyrtc.tasks.relayed_data.RelayedDataTask = null;
-    private secureDataChannel: saltyrtc.tasks.webrtc.SecureDataChannel = null;
+    private secureDataChannel: UnboundedFlowControlledDataChannel = null;
+    private secureDataChannelCrypto: saltyrtc.tasks.webrtc.DataChannelCryptoContext = null;
+    private secureDataChannelChunkLength: number = null;
+    private secureDataChannelMessageId: number = 0;
     public chosenTask: threema.ChosenTask = threema.ChosenTask.None;
     private outgoingMessageSequenceNumber: SequenceNumber;
     private previousConnectionId: Uint8Array = null;
@@ -433,12 +439,28 @@ export class WebClientService {
         // Create new handshake future
         this.connectionInfoFuture = new Future();
 
-        // Create WebRTC task instance
-        const maxPacketSize = this.browserService.getBrowser().isFirefox(false) ? 16384 : 65536;
-        this.webrtcTask = new saltyrtcTaskWebrtc.WebRTCTask(true, maxPacketSize, this.config.SALTYRTC_LOG_LEVEL);
+        // Create tasks
+        const tasks: saltyrtc.Task[] = [];
+
+        // Create WebRTC task instance (if supported)
+        if (this.browserService.supportsWebrtcTask()) {
+            // TODO: Remove legacy v0 after a transitional period
+            tasks.push(new saltyrtcTaskWebrtc.WebRTCTaskBuilder()
+                .withLoggingLevel(this.config.SALTYRTC_LOG_LEVEL)
+                .withVersion('v1')
+                .withHandover(true)
+                .build());
+            tasks.push(new saltyrtcTaskWebrtc.WebRTCTaskBuilder()
+                .withLoggingLevel(this.config.SALTYRTC_LOG_LEVEL)
+                .withVersion('v0')
+                .withHandover(true)
+                .withMaxChunkLength(this.browserService.getBrowser().isFirefox(false) ? 16384 : 65536)
+                .build());
+        }
 
         // Create Relayed Data task instance
         this.relayedDataTask = new saltyrtcTaskRelayedData.RelayedDataTask(this.config.DEBUG);
+        tasks.push(this.relayedDataTask);
 
         // Create new keystore if necessary
         if (!keyStore) {
@@ -454,14 +476,6 @@ export class WebClientService {
             this.saltyRtcHost = this.config.SALTYRTC_HOST_PREFIX
                 + keyStore.publicKeyHex.substr(0, 2)
                 + this.config.SALTYRTC_HOST_SUFFIX;
-        }
-
-        // Determine SaltyRTC tasks
-        let tasks;
-        if (this.browserService.supportsWebrtcTask()) {
-            tasks = [this.webrtcTask, this.relayedDataTask];
-        } else {
-            tasks = [this.relayedDataTask];
         }
 
         // Create SaltyRTC client
@@ -529,19 +543,11 @@ export class WebClientService {
         // Once the connection is established, if this is a WebRTC connection,
         // initiate the peer connection and start the handover.
         this.salty.once('state-change:task', () => {
-
             // Determine chosen task
             const task = this.salty.getTask();
             if (task.getName().indexOf('webrtc.tasks.saltyrtc.org') !== -1) {
+                this.webrtcTask = task as saltyrtc.tasks.webrtc.WebRTCTask;
                 this.chosenTask = threema.ChosenTask.WebRTC;
-            } else if (task.getName().indexOf('relayed-data.tasks.saltyrtc.org') !== -1) {
-                this.chosenTask = threema.ChosenTask.RelayedData;
-            } else {
-                throw new Error('Invalid or unknown task name: ' + task.getName());
-            }
-
-            // If the WebRTC task was chosen, initialize handover.
-            if (this.chosenTask === threema.ChosenTask.WebRTC) {
                 const browser = this.browserService.getBrowser();
 
                 // Firefox <53 does not yet support TLS. Skip it, to save allocations.
@@ -554,6 +560,7 @@ export class WebClientService {
                     this.skipIceDs();
                 }
 
+                // Create peer connection
                 this.pcHelper = new PeerConnectionHelper(this.$log, this.$q, this.$timeout,
                     this.$rootScope, this.webrtcTask,
                     this.config.ICE_SERVERS,
@@ -564,13 +571,16 @@ export class WebClientService {
                     this.stateService.updateTaskConnectionState(state);
                 };
 
-                // Initiate handover
-                this.webrtcTask.handover(this.pcHelper.peerConnection);
+                // Initiate handover process
+                this.pcHelper.handover();
+            } else if (task.getName().indexOf('relayed-data.tasks.saltyrtc.org') !== -1) {
+                this.chosenTask = threema.ChosenTask.RelayedData;
 
-            // Otherwise, no handover is necessary.
-            } else {
+                // No handover necessary
                 this.onHandover(resumeSession);
                 return;
+            } else {
+                throw new Error('Invalid or unknown task name: ' + task.getName());
             }
         });
 
@@ -583,11 +593,8 @@ export class WebClientService {
 
         // Wait for handover to be finished
         this.salty.on('handover', () => {
-            // Ignore handovers requested by non-WebRTC tasks
-            if (this.chosenTask === threema.ChosenTask.WebRTC) {
-                this.$log.debug(this.logTag, 'Handover done');
-                this.onHandover(resumeSession);
-            }
+            this.$log.debug(this.logTag, 'Handover done');
+            this.onHandover(resumeSession);
         });
 
         // Handle SaltyRTC errors
@@ -947,36 +954,64 @@ export class WebClientService {
 
         // Derive connection ID
         // Note: We need to make sure this is done before any ARP messages can be received
-        const box = this.salty.encryptForPeer(new Uint8Array(0), WebClientService.CONNECTION_ID_NONCE);
+        const connectionIdBox = this.salty.encryptForPeer(new Uint8Array(0), WebClientService.CONNECTION_ID_NONCE);
         // Note: We explicitly copy the data here to be able to use the underlying buffer directly
-        this.currentConnectionId = new Uint8Array(box.data);
+        this.currentConnectionId = new Uint8Array(connectionIdBox.data);
 
         // If the WebRTC task was chosen, initialize the data channel
         if (this.chosenTask === threema.ChosenTask.WebRTC) {
-            // Create secure data channel
-            this.$log.debug(this.logTag, 'Create SecureDataChannel "' + WebClientService.DC_LABEL + '"...');
-            this.secureDataChannel = this.pcHelper.createSecureDataChannel(WebClientService.DC_LABEL);
-            this.secureDataChannel.onopen = () => {
-                this.$log.debug(this.logTag, 'SecureDataChannel open');
+            // Create data channel
+            this.$log.debug(this.logTag, `Creating data channel ${WebClientService.DC_LABEL}`);
+            const dc = this.pcHelper.pc.createDataChannel(WebClientService.DC_LABEL);
+            dc.binaryType = 'arraybuffer';
+
+            // Wrap as unbounded, flow-controlled data channel
+            this.secureDataChannel = new UnboundedFlowControlledDataChannel(this.$log, dc);
+
+            // Create crypto context
+            // Note: We need to apply encrypt-then-chunk for backwards
+            //       compatibility reasons.
+            this.secureDataChannelCrypto = this.webrtcTask.getCryptoContext(dc.id);
+
+            // Create unchunker
+            // Note: We need to use an unreliable unordered unchunker for backwards
+            //       compatibility reasons.
+            const unchunker = new chunkedDc.UnreliableUnorderedUnchunker();
+
+            // Bind events
+            dc.onopen = () => {
+                this.$log.info(this.logTag, `Data channel ${dc.label} open`);
+
+                // Determine chunk length
+                this.secureDataChannelChunkLength = Math.min(
+                    WebClientService.DATA_CHANNEL_MAX_CHUNK_SIZE, this.pcHelper.pc.sctp.maxMessageSize);
+                this.$log.debug(this.logTag, `Using chunk length: ${this.secureDataChannelChunkLength} for data` +
+                    `channel ${dc.label}`);
+
+                // Connection established
                 this.onConnectionEstablished(resumeSession).catch((error) => {
                     this.$log.error(this.logTag, 'Error during handshake:', error);
                 });
             };
-
-            // Handle incoming messages
-            this.secureDataChannel.onmessage = (ev: MessageEvent) => {
-                const bytes = new Uint8Array(ev.data);
-                this.handleIncomingMessageBytes(bytes);
+            dc.onclose = () => {
+                this.$log.error(this.logTag, `Data channel ${dc.label} closed prematurely`);
+                this.failSession();
             };
-            this.secureDataChannel.onbufferedamountlow = (ev: Event) => {
-                this.$log.debug('Secure data channel: Buffered amount low');
+            dc.onerror = (event) => {
+                this.$log.error(this.logTag, `Data channel ${dc.label} error:`, event);
+                this.failSession();
             };
-            this.secureDataChannel.onerror = (e: ErrorEvent) => {
-                this.$log.warn('Secure data channel: Error:', e.message);
-                this.$log.debug(e);
+            dc.onmessage = (event) => {
+                this.$log.debug(this.logTag, `Data channel ${dc.label} incoming chunk ` +
+                    `of length ${event.data.byteLength}`);
+                unchunker.add(new Uint8Array(event.data));
             };
-            this.secureDataChannel.onclose = (ev: Event) => {
-                this.$log.warn('Secure data channel: Closed');
+            // noinspection JSUndefinedPropertyAssignment
+            unchunker.onMessage = (array) => {
+                const box = saltyrtcClient.Box.fromUint8Array(
+                    array, saltyrtcTaskWebrtc.DataChannelCryptoContext.NONCE_LENGTH);
+                const message = this.secureDataChannelCrypto.decrypt(box);
+                this.handleIncomingMessageBytes(message);
             };
         } else if (this.chosenTask === threema.ChosenTask.RelayedData) {
             // Handle messages directly
@@ -1174,13 +1209,13 @@ export class WebClientService {
 
         // Close data channel
         if (this.secureDataChannel !== null) {
-            this.$log.debug(this.logTag, 'Closing secure datachannel');
-            this.secureDataChannel.onopen = null;
-            this.secureDataChannel.onmessage = null;
-            this.secureDataChannel.onbufferedamountlow = null;
-            this.secureDataChannel.onerror = null;
-            this.secureDataChannel.onclose = null;
-            this.secureDataChannel.close();
+            this.$log.debug(this.logTag, 'Closing data channel');
+            this.secureDataChannel.dc.onopen = null;
+            this.secureDataChannel.dc.onmessage = null;
+            this.secureDataChannel.dc.onbufferedamountlow = null;
+            this.secureDataChannel.dc.onerror = null;
+            this.secureDataChannel.dc.onclose = null;
+            this.secureDataChannel.dc.close();
         }
 
         // Close SaltyRTC connection
@@ -3726,7 +3761,14 @@ export class WebClientService {
                     if (this.config.MSGPACK_DEBUGGING) {
                         this.$log.debug('Outgoing message payload: ' + msgpackVisualizer(bytes));
                     }
-                    this.secureDataChannel.send(bytes);
+                    const box = this.secureDataChannelCrypto.encrypt(bytes);
+                    const chunker = new chunkedDc.UnreliableUnorderedChunker(
+                        this.secureDataChannelMessageId++, box.toUint8Array(), this.secureDataChannelChunkLength);
+                    for (const chunk of chunker) {
+                        this.$log.debug(this.logTag, `Data channel ${this.secureDataChannel.dc.label} outgoing ` +
+                            `chunk of length ${chunk.byteLength}`);
+                        this.secureDataChannel.write(chunk);
+                    }
                 }
                 break;
             case threema.ChosenTask.RelayedData:
@@ -3744,7 +3786,7 @@ export class WebClientService {
                     // Increment the outgoing message sequence number
                     const messageSequenceNumber = this.outgoingMessageSequenceNumber.increment();
                     const chunker = new chunkedDc.UnreliableUnorderedChunker(
-                        messageSequenceNumber, bytes, WebClientService.CHUNK_SIZE);
+                        messageSequenceNumber, bytes, WebClientService.RELAYED_DATA_CHUNK_SIZE);
                     for (const chunk of chunker) {
                         // Send (and cache)
                         this.sendChunk(chunk, retransmit, canQueue, true);
@@ -3857,7 +3899,6 @@ export class WebClientService {
 
         // Decode bytes
         const message: threema.WireMessage = this.msgpackDecode(bytes);
-
         return this.handleIncomingMessage(message);
     }
 
